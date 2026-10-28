@@ -111,7 +111,7 @@ def reason(seen, assigned, name, pinned, now):
     if name == pinned:
         return "手动指定了新账号"
     if blocked(seen.get(assigned), now):
-        return "额度已用完"
+        return {"revoked": "的凭证被拒，可能已失效", "burst": "被临时限流"}.get(seen[assigned].get("blocked_for"), "额度已用完")
     if room(seen.get(assigned), now) <= 0:
         return "额度快用完"
     left, seconds = weekly(seen.get(name), now)
@@ -132,9 +132,12 @@ def observe(info, headers, status, now):
         # Out of quota: rejected until the window resets. Any other 429 is a short burst limit.
         rejected = header("status") == "rejected"
         info["blocked_until"] = int(header("reset") or now + 300) if rejected else now + 60
+        info["blocked_for"] = "quota" if rejected else "burst"
     elif status == 401:
-        # The token was revoked, e.g. by signing out of that account; set aside for a day.
+        # The token was revoked, e.g. by signing out of that account; set aside for a day,
+        # or until a new token is added for it.
         info["blocked_until"] = now + 86400
+        info["blocked_for"] = "revoked"
     info["seen"] = now
 
 
@@ -192,8 +195,16 @@ class Pool:
         if mtime != self.mtime:
             self.mtime = mtime
             self.config = read_json(CONFIG, {})
-            self.tokens = {a["name"]: dpapi(base64.b64decode(a["token"]), False).decode()
-                           for a in self.config.get("accounts", [])}
+            tokens = {a["name"]: dpapi(base64.b64decode(a["token"]), False).decode()
+                      for a in self.config.get("accounts", [])}
+            # An account added again while running gets a fresh start: a lock set on its old token
+            # (a refused one, most likely) says nothing about the new one.
+            for name, token in tokens.items():
+                if self.tokens and self.tokens.get(name) != token:
+                    info = self.state["accounts"].get(name, {})
+                    info.pop("blocked_until", None)
+                    info.pop("blocked_for", None)
+            self.tokens = tokens
 
     def pick(self, session, exclude=()):
         """The account to send a conversation's next request with, or None to pass the request through."""

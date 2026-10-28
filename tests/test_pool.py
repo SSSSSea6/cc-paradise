@@ -109,6 +109,9 @@ def _():
     revoked = {}
     pool.observe(revoked, {}, 401, NOW)
     assert revoked["blocked_until"] == NOW + 86400
+    assert (info["blocked_for"], burst["blocked_for"], revoked["blocked_for"]) == ("quota", "burst", "revoked")
+    assert pool.reason({"A": revoked}, "A", "B", None, NOW) == "的凭证被拒，可能已失效"
+    assert pool.reason({"A": info}, "A", "B", None, NOW) == "额度已用完"
     seen = {"A": info, "B": burst}
     assert pool.choose(["A", "B"], seen, "A", None, NOW) is None
     assert pool.choose(["A", "B"], seen, "A", None, NOW + 61) == "B"
@@ -251,6 +254,20 @@ def _():
     assert keeper.pick("s1")[0] == "A"
     keeper.state["sessions"]["s1"][1] -= pool.AFFINITY
     assert keeper.pick("s1")[0] == "B" and keeper.state["switch"] is None
+
+
+@test("运行中给账号换了新令牌就解除它的暂停；只改别的设置、或代理重启，暂停照旧")
+def _():
+    seal = lambda token: base64.b64encode(pool.dpapi(token.encode(), True)).decode()
+    accounts = lambda a_token: [{"name": "A", "token": seal(a_token)}, {"name": "B", "token": seal("b")}]
+    pool.write_json(pool.CONFIG, {"accounts": accounts("old")})
+    pool.write_json(pool.STATE, {"current": None, "accounts": {"A": {"blocked_until": time.time() + DAY, "blocked_for": "revoked"}}, "switch": None})
+    keeper = pool.Pool()
+    assert keeper.pick("s1")[0] == "B"
+    pool.write_json(pool.CONFIG, {"pinned": "A", "accounts": accounts("old")})
+    assert keeper.pick("s1")[0] == "B"
+    pool.write_json(pool.CONFIG, {"pinned": "A", "accounts": accounts("new")})
+    assert keeper.pick("s1")[0] == "A"
 
 
 print(f"RESULT failed={failed}")

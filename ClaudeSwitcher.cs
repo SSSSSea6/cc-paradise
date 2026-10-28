@@ -536,7 +536,19 @@ namespace ClaudeSwitcher
                 double left = Window(seen, window[0], out reset);
                 parts.Add(window[1] + "剩 " + Percent(left) + (reset > 0 ? "，" + Until(reset) + "后刷新" : ""));
             }
-            return string.Join(" · ", parts) + (Json.Number(seen, "blocked_until") > Now ? "（暂停中）" : "");
+            return string.Join(" · ", parts) + (Json.Number(seen, "blocked_until") > Now ? "（" + Paused(seen) + "）" : "");
+        }
+
+        /// Why an account is set aside: a refused token is fixed by adding the account again.
+        public static string Paused(object seen)
+        {
+            string until = Until((long)Json.Number(seen, "blocked_until"));
+            switch (Json.Text(seen, "blocked_for"))
+            {
+                case "revoked": return "凭证被拒，重新添加后恢复";
+                case "burst": return "被临时限流，" + until + "后恢复";
+                default: return "额度已用完，" + until + "后恢复";
+            }
         }
 
         public static Row[] Rows(object config, object state)
@@ -549,7 +561,7 @@ namespace ClaudeSwitcher
                 var tags = new List<string>();
                 if (name == Json.Text(state, "current")) tags.Add("正在用");
                 if (name == Json.Text(config, "pinned")) tags.Add("已固定");
-                if (Json.Number(seen, "blocked_until") > Now) { tags = new List<string> { Until((long)Json.Number(seen, "blocked_until")) + "后恢复" }; row.Alert = true; }
+                if (Json.Number(seen, "blocked_until") > Now) { tags = new List<string> { Paused(seen) }; row.Alert = true; }
                 if (tags.Count > 0) row.Tag = string.Join(" · ", tags);
                 if (seen == null) row.Note = "还没用过，额度未知";
                 else
