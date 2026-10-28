@@ -41,6 +41,10 @@ namespace ClaudeSwitcher
             Application.SetCompatibleTextRenderingDefault(false);
             Application.ThreadException += (s, e) => Report(e.Exception);
             AppDomain.CurrentDomain.UnhandledException += (s, e) => Report((Exception)e.ExceptionObject);
+            // Started by an MSIX-packaged program (Codex, for one), this process and everything it starts
+            // would write AppData into that package's private copy, where the rotation window's sessions
+            // then go missing. The desktop shell starts it again outside.
+            if (Native.Packaged() && Native.RunOutside(Paths.Exe, string.Join(" ", args))) return;
             Directory.CreateDirectory(Paths.Data);
 
             if (args.Contains("--open-window"))
@@ -448,11 +452,26 @@ namespace ClaudeSwitcher
             }
             finally { Marshal.ReleaseComObject(store); }
             if (SendMessage(h, 0x7F, (IntPtr)1, IntPtr.Zero) != icon) { SendMessage(h, 0x80, (IntPtr)0, icon); SendMessage(h, 0x80, (IntPtr)1, icon); }
-            if (moved && IsWindowVisible(h))
+            // A button added for a window stays on the taskbar after Claude hides that window, as a blank
+            // entry that does not open, so a hidden window has its button taken away once.
+            bool visible = IsWindowVisible(h);
+            if (visible && moved) Button(h, true);
+            else if (!visible && cleared.Add(h)) Button(h, false);
+            if (visible) cleared.Remove(h);
+        }
+
+        static readonly HashSet<IntPtr> cleared = new HashSet<IntPtr>();
+
+        static void Button(IntPtr h, bool add)
+        {
+            var taskbar = (ITaskbarList)new TaskbarList();
+            try
             {
-                var taskbar = (ITaskbarList)new TaskbarList();
-                try { taskbar.HrInit(); taskbar.DeleteTab(h); taskbar.AddTab(h); } finally { Marshal.ReleaseComObject(taskbar); }
+                taskbar.HrInit();
+                taskbar.DeleteTab(h);
+                if (add) taskbar.AddTab(h);
             }
+            finally { Marshal.ReleaseComObject(taskbar); }
         }
 
         public static void TagShortcut(string path, string id)
@@ -829,6 +848,30 @@ namespace ClaudeSwitcher
                 finally { Marshal.FreeHGlobal(buffer); }
             }
             finally { CloseHandle(process); }
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern int GetCurrentPackageFullName(ref int length, StringBuilder name);
+
+        public static bool Packaged()
+        {
+            int length = 0;
+            return GetCurrentPackageFullName(ref length, null) != 15700;  // APPMODEL_ERROR_NO_PACKAGE
+        }
+
+        /// Starts a program through the desktop's own shell window, so it runs as the desktop's child
+        /// rather than this process's; false when the desktop could not be reached.
+        public static bool RunOutside(string file, string arguments)
+        {
+            try
+            {
+                dynamic windows = Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("9BA05972-F6A8-11CF-A442-00A0C90A8F39")));
+                object location = 0, root = null;  // CSIDL_DESKTOP
+                int hwnd;
+                dynamic desktop = windows.FindWindowSW(ref location, ref root, 8, out hwnd, 1);  // SWC_DESKTOP, SWFO_NEEDDISPATCH
+                desktop.Document.Application.ShellExecute(file, arguments, Path.GetDirectoryName(file), "open", 1);
+                return true;
+            }
+            catch (Exception) { return false; }
         }
 
         /// These windows' class has no cursor, so without this the pointer keeps whatever shape

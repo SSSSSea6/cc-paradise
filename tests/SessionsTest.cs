@@ -1,5 +1,5 @@
 ﻿// 从主账号导入会话的测试。和程序源码编译在一起，在 tests 目录里：
-//   %WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /main:T /r:System.Web.Extensions.dll /r:Microsoft.VisualBasic.dll SessionsTest.cs ..\ClaudeSwitcher.cs
+//   %WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /main:T /r:System.Web.Extensions.dll /r:Microsoft.VisualBasic.dll /r:Microsoft.CSharp.dll SessionsTest.cs ..\ClaudeSwitcher.cs
 //   SessionsTest.exe [正在回复的会话的对话编号]
 // 给了对话编号（例如在 Claude Code 会话里跑时用它自己的）才测“正在回复”的正例。
 using System; using System.IO; using System.Linq; using ClaudeSwitcher;
