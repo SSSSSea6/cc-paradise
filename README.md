@@ -9,7 +9,7 @@
 ## 它做什么
 
 - **轮换窗口**：用单独数据目录打开的 Claude 桌面端，有自己独立的任务栏按钮。只有这个窗口的请求经过本机代理。
-- **自动选号**：账号一个一个用。会话一直用当前账号，快到上限（5 小时或本周额度用到 95%）才换。几个账号都有余量时，先用周额度最早重置的那个，免得额度过期作废。被拒的请求会自动换号重发。
+- **自动选号**：账号一个一个用。会话一直用当前账号，快到上限（5 小时或本周额度用到 95%）才换。如果另一个账号的周额度快要作废（不用就作废的速度是当前账号的两倍以上，且还剩 20% 以上），就提前换过去先用它。被拒的请求会自动换号重发。
 - **额度悬浮条**：常驻在屏幕下方，可以拖进任务栏，会自动吸附到边缘。显示当前账号 5 小时和本周的剩余额度。单击弹出全部账号的额度和刷新倒计时，右键是管理菜单。有窗口全屏时自动隐藏。
 - **托盘**：图标上显示当前账号的剩余百分比，切号时弹提示。
 - **从主账号导入会话**：把默认窗口里的某个编程会话移到轮换窗口接着聊。
@@ -97,7 +97,7 @@ ClaudeSwitcher rotates several Claude subscription accounts behind the Claude de
 - Quota is read from the `anthropic-ratelimit-unified-*` response headers. The proxy never sends requests of its own.
 - Tokens are stored encrypted with Windows DPAPI.
 
-**Account selection**: accounts are used up one at a time. A session stays on its account until the account reaches 95% of its 5-hour or weekly limit. When several accounts have room, the one whose weekly quota resets first goes first. A rejected request is retried on the next account.
+**Account selection**: accounts are used up one at a time. A session stays on its account until the account reaches 95% of its 5-hour or weekly limit. It moves early only when another account's weekly quota would go to waste at least twice as fast and has at least 20% left. A rejected request is retried on the next account.
 
 **Requirements**: Windows 10/11 with Claude Desktop, Python 3.10+ on PATH with `pip install cryptography`, and .NET Framework 4.8 (built into Windows).
 

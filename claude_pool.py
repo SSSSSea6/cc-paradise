@@ -37,7 +37,7 @@ API = "api.anthropic.com"
 SWITCH_AT = 0.95                      # leave an account this close to either limit
 HEADROOM = 0.10                       # a new conversation wants at least this much room
 AFFINITY = 3600                       # a conversation idle this long has lost its prompt cache anyway
-RESCUE_WITHIN, RESCUE_LEFT = 12 * 3600, 0.15  # weekly quota worth a cache miss before it resets unused
+RESCUE_RATIO, RESCUE_LEFT = 2, 0.20   # move early to weekly quota going to waste this many times faster, with this much left
 WEEK = 7 * 86400
 KEEP = 240                            # seconds an idle API connection is kept for reuse (the API keeps them 5+ minutes)
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-connection", "content-length"}
@@ -73,9 +73,12 @@ def urgency(seen, now):
     return (1 - u) / max(reset - now, 3600) if reset > now else 0
 
 
-def expiring(seen, now):
-    left, seconds = weekly(seen, now)
-    return seconds < RESCUE_WITHIN and left - (1 - SWITCH_AT) >= RESCUE_LEFT
+def outruns(other, this, now):
+    """Whether another account's weekly quota is clearly the one to use first: it goes to waste at
+    least RESCUE_RATIO times as fast, with RESCUE_LEFT of it still to use. Accounts about as urgent
+    as each other do not trade places, so conversations do not bounce between them."""
+    left, _ = weekly(other, now)
+    return left - (1 - SWITCH_AT) >= RESCUE_LEFT and urgency(other, now) > RESCUE_RATIO * urgency(this, now)
 
 
 def choose(names, seen, assigned, pinned, now, exclude=(), current=None):
@@ -84,7 +87,7 @@ def choose(names, seen, assigned, pinned, now, exclude=(), current=None):
     Accounts are used up one at a time. A conversation keeps its account while that has room, so
     its prompt cache stays warm; a new one, or one back after its cache expired, joins the account
     in use while that has room to spare. Either moves early only when another account's weekly
-    quota is about to reset unused. Otherwise it goes to the account that would waste the most by
+    quota is clearly closer to going to waste. Otherwise it goes to the account that would waste the most by
     waiting (soonest weekly reset, most left), preferring ones with room to spare; accounts whose
     week has not started are kept for later. With every account at its limit it stays put, or
     takes the one with the most left."""
@@ -97,8 +100,7 @@ def choose(names, seen, assigned, pinned, now, exclude=(), current=None):
     best = max(roomy, key=lambda n: (room(seen.get(n), now) >= HEADROOM, urgency(seen.get(n), now)))
 
     def keeps(name, need):
-        return (name in roomy and room(seen.get(name), now) >= need
-                and not (expiring(seen.get(best), now) and urgency(seen.get(best), now) > urgency(seen.get(name), now)))
+        return name in roomy and room(seen.get(name), now) >= need and not outruns(seen.get(best), seen.get(name), now)
     if keeps(assigned, 0):
         return assigned
     if keeps(current, HEADROOM):

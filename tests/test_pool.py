@@ -39,7 +39,7 @@ DAY = 86400
 
 @test("会话的账号没到上限就不换，到上限换成周额度最先作废的那个，没开始计周的留着")
 def _():
-    seen = {"A": {"5h": [0.5, NOW + 99]}, "B": {"7d": [0.4, NOW + 3 * DAY]}, "C": {"7d": [0.1, NOW + 6 * DAY]}}
+    seen = {"A": {"5h": [0.5, NOW + 99], "7d": [0.5, NOW + 3 * DAY]}, "B": {"7d": [0.4, NOW + 3 * DAY]}, "C": {"7d": [0.1, NOW + 6 * DAY]}}
     assert pool.choose(["A", "B", "C", "D"], seen, "A", None, NOW) == "A"
     seen["A"]["5h"] = [0.96, NOW + 99]
     assert pool.choose(["A", "B", "C", "D"], seen, "A", None, NOW) == "B"
@@ -69,7 +69,7 @@ def _():
     assert pool.choose(["A", "B"], seen, "B", None, NOW) == "B"
 
 
-@test("别的账号周额度快作废且剩得多时，正在聊的会话也换过去用掉它")
+@test("别的账号周额度作废得明显更快、还剩得多时，正在聊的会话也换过去用掉它；差不多时不换")
 def _():
     seen = {"A": {"7d": [0.2, NOW + 5 * DAY]}, "B": {"7d": [0.6, NOW + 3 * 3600]}}
     assert pool.choose(["A", "B"], seen, "A", None, NOW) == "B"
@@ -78,6 +78,10 @@ def _():
     assert pool.choose(["A", "B"], seen, "A", None, NOW) == "A"
     seen["B"]["7d"] = [0.9, NOW + 3 * 3600]
     assert pool.choose(["A", "B"], seen, "A", None, NOW) == "A"
+    # A day before its reset with most of the week left, long before any last-hours rush.
+    seen = {"A": {"7d": [0.54, NOW + 5 * DAY]}, "B": {"7d": [0.13, NOW + DAY]}}
+    assert pool.choose(["A", "B"], seen, "A", None, NOW, current="A") == "B"
+    assert pool.choose(["A", "B"], seen, None, None, NOW, current="A") == "B"
 
 
 @test("在用付费超额的账号先让给别的，别的也用完了才接着用")
@@ -248,7 +252,7 @@ def _():
     pool.write_json(pool.STATE, {"current": None, "accounts": {"A": {"7d": [0.5, time.time() + 3 * DAY]}}, "switch": None})
     keeper = pool.Pool()
     assert keeper.pick("s1")[0] == "A"
-    keeper.state["accounts"]["B"] = {"7d": [0.5, time.time() + DAY]}
+    keeper.state["accounts"]["B"] = {"7d": [0.5, time.time() + 2 * DAY]}  # a little more urgent than A, not enough to move
     assert keeper.pick("s1")[0] == "A" and keeper.pick("s2")[0] == "A"
     keeper.state["accounts"]["A"]["5h"] = [0.9, time.time() + 99]  # too little left to bring a conversation to it
     assert keeper.pick("s1")[0] == "A"
