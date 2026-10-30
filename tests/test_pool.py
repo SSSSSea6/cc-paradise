@@ -37,25 +37,27 @@ def test(name):
 DAY = 86400
 
 
-@test("会话的账号没到上限就不换，到上限换成周额度最先作废的那个，没开始计周的留着")
+@test("缓存还在的会话一直用到被拒；被拒后换到周额度最先重置的账号，没开始计周的留到最后")
 def _():
     seen = {"A": {"5h": [0.5, NOW + 99], "7d": [0.5, NOW + 3 * DAY]}, "B": {"7d": [0.4, NOW + 3 * DAY]}, "C": {"7d": [0.1, NOW + 6 * DAY]}}
     assert pool.choose(["A", "B", "C", "D"], seen, "A", None, NOW) == "A"
-    seen["A"]["5h"] = [0.96, NOW + 99]
+    seen["A"]["5h"] = [0.99, NOW + 99]
+    assert pool.choose(["A", "B", "C", "D"], seen, "A", None, NOW) == "A"
+    seen["A"]["blocked_until"] = NOW + 99
     assert pool.choose(["A", "B", "C", "D"], seen, "A", None, NOW) == "B"
     assert pool.choose(["C", "D"], seen, None, None, NOW) == "C"
     assert pool.choose(["D", "E"], {"E": {"7d": [0.07, NOW + 158 * 3600]}}, None, None, NOW) == "E"
 
 
-@test("新会话和闲置回来的会话跟着正在用的账号走，用到余量不足才换")
+@test("新会话和闲置回来的会话跟着正在用的账号走，余量不足或别的账号周额度早一天以上重置才换")
 def _():
-    seen = {"A": {"7d": [0.44, NOW + 111 * 3600]}, "B": {"7d": [0.34, NOW + 83 * 3600]}}
+    seen = {"A": {"7d": [0.44, NOW + 111 * 3600]}, "B": {"7d": [0.34, NOW + 100 * 3600]}}
     assert pool.choose(["A", "B"], seen, None, None, NOW, current="A") == "A"
     assert pool.choose(["A", "B"], seen, None, None, NOW) == "B"
     seen["A"]["5h"] = [0.9, NOW + 99]
     assert pool.choose(["A", "B"], seen, None, None, NOW, current="A") == "B"
     seen["A"]["5h"] = [0.2, NOW + 99]
-    seen["B"]["7d"] = [0.6, NOW + 3 * 3600]
+    seen["B"]["7d"] = [0.34, NOW + 86 * 3600]
     assert pool.choose(["A", "B"], seen, None, None, NOW, current="A") == "B"
 
 
@@ -69,19 +71,17 @@ def _():
     assert pool.choose(["A", "B"], seen, "B", None, NOW) == "B"
 
 
-@test("别的账号周额度作废得明显更快、还剩得多时，正在聊的会话也换过去用掉它；差不多时不换")
+@test("周额度快作废的账号只接新会话；正在聊的会话不为它重付缓存")
 def _():
-    seen = {"A": {"7d": [0.2, NOW + 5 * DAY]}, "B": {"7d": [0.6, NOW + 3 * 3600]}}
-    assert pool.choose(["A", "B"], seen, "A", None, NOW) == "B"
-    assert "3 小时后重置、还剩 40%" in pool.reason(seen, "A", "B", None, NOW)
-    seen["B"]["7d"] = [0.6, NOW + 2 * DAY]
-    assert pool.choose(["A", "B"], seen, "A", None, NOW) == "A"
-    seen["B"]["7d"] = [0.9, NOW + 3 * 3600]
-    assert pool.choose(["A", "B"], seen, "A", None, NOW) == "A"
-    # A day before its reset with most of the week left, long before any last-hours rush.
+    # A day before its reset with most of the week left.
     seen = {"A": {"7d": [0.54, NOW + 5 * DAY]}, "B": {"7d": [0.13, NOW + DAY]}}
-    assert pool.choose(["A", "B"], seen, "A", None, NOW, current="A") == "B"
+    assert pool.choose(["A", "B"], seen, "A", None, NOW, current="A") == "A"
     assert pool.choose(["A", "B"], seen, None, None, NOW, current="A") == "B"
+    seen["B"]["7d"] = [0.9, NOW + DAY]
+    assert pool.choose(["A", "B"], seen, None, None, NOW, current="A") == "A"
+    # A week just started resets later, however much of it is left: nothing of it is about to go to waste.
+    seen = {"A": {"7d": [0.77, NOW + 92 * 3600]}, "B": {"7d": [0.13, NOW + 161 * 3600]}}
+    assert pool.choose(["A", "B"], seen, None, None, NOW, current="A") == "A"
 
 
 @test("在用付费超额的账号先让给别的，别的也用完了才接着用")
@@ -90,6 +90,7 @@ def _():
     pool.observe(info, {"anthropic-ratelimit-unified-overage-in-use": "true", "anthropic-ratelimit-unified-reset": str(NOW + 3600)}, 200, NOW)
     seen = {"A": info, "B": {"7d": [0.5, NOW + 5 * DAY]}}
     assert pool.choose(["A", "B"], seen, "A", None, NOW) == "B"
+    assert pool.reason(seen, "A", "B", None, NOW) == "开始按超额付费"
     seen["B"]["blocked_until"] = NOW + 99
     assert pool.choose(["A", "B"], seen, "A", None, NOW) == "A"
 
@@ -252,7 +253,7 @@ def _():
     pool.write_json(pool.STATE, {"current": None, "accounts": {"A": {"7d": [0.5, time.time() + 3 * DAY]}}, "switch": None})
     keeper = pool.Pool()
     assert keeper.pick("s1")[0] == "A"
-    keeper.state["accounts"]["B"] = {"7d": [0.5, time.time() + 2 * DAY]}  # a little more urgent than A, not enough to move
+    keeper.state["accounts"]["B"] = {"7d": [0.5, time.time() + 2.5 * DAY]}  # resets a little sooner than A, not enough to move
     assert keeper.pick("s1")[0] == "A" and keeper.pick("s2")[0] == "A"
     keeper.state["accounts"]["A"]["5h"] = [0.9, time.time() + 99]  # too little left to bring a conversation to it
     assert keeper.pick("s1")[0] == "A"

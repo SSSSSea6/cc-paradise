@@ -34,11 +34,10 @@ CERTS = HOME / "proxy"
 SETTINGS = Path.home() / ".claude" / "settings.json"
 PORT = 47630
 API = "api.anthropic.com"
-SWITCH_AT = 0.95                      # leave an account this close to either limit
-HEADROOM = 0.10                       # a new conversation wants at least this much room
+SWITCH_AT = 0.95                      # a conversation starting afresh avoids accounts this close to either limit
+HEADROOM = 0.10                       # and wants at least this much room
 AFFINITY = 3600                       # a conversation idle this long has lost its prompt cache anyway
-RESCUE_RATIO, RESCUE_LEFT = 2, 0.20   # move early to weekly quota going to waste this many times faster, with this much left
-WEEK = 7 * 86400
+RESCUE_LEAD, RESCUE_LEFT = 24 * 3600, 0.20  # weekly quota resetting this much sooner, with this much left, goes first
 KEEP = 240                            # seconds an idle API connection is kept for reuse (the API keeps them 5+ minutes)
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-connection", "content-length"}
 
@@ -55,55 +54,50 @@ def blocked(seen, now):
     return (seen or {}).get("blocked_until", 0) > now
 
 
+def paying(seen, now):
+    return (seen or {}).get("overage_until", 0) > now
+
+
 def room(seen, now):
     """How far an account is from SWITCH_AT; none while it is drawing on paid extra usage."""
-    return 0 if (seen or {}).get("overage_until", 0) > now else SWITCH_AT - used(seen, now)
+    return 0 if paying(seen, now) else SWITCH_AT - used(seen, now)
 
 
-def weekly(seen, now):
-    """(share left, seconds to reset) of the weekly window; one not started yet has the whole week ahead."""
-    u, reset = (seen or {}).get("7d", (0, 0))
-    return (1 - u, reset - now) if reset > now else (1, WEEK)
+def resets(seen, now):
+    """When the weekly window resets; one not started yet never runs out, so it comes last."""
+    reset = (seen or {}).get("7d", (0, 0))[1]
+    return reset if reset > now else float("inf")
 
 
-def urgency(seen, now):
-    """Weekly quota left per hour until it resets: what is lost if this account sits idle.
-    A week not started loses nothing by waiting."""
-    u, reset = (seen or {}).get("7d", (0, 0))
-    return (1 - u) / max(reset - now, 3600) if reset > now else 0
-
-
-def outruns(other, this, now):
-    """Whether another account's weekly quota is clearly the one to use first: it goes to waste at
-    least RESCUE_RATIO times as fast, with RESCUE_LEFT of it still to use. Accounts about as urgent
-    as each other do not trade places, so conversations do not bounce between them."""
-    left, _ = weekly(other, now)
-    return left - (1 - SWITCH_AT) >= RESCUE_LEFT and urgency(other, now) > RESCUE_RATIO * urgency(this, now)
+def sooner(other, this, now):
+    """Whether another account's weekly quota is clearly the one to use first: it resets at least
+    RESCUE_LEAD sooner with RESCUE_LEFT of it still to use. Accounts resetting about together do not
+    trade places, so conversations do not bounce between them."""
+    left = 1 - (other or {}).get("7d", (0, 0))[0] if resets(other, now) < float("inf") else 1
+    return left - (1 - SWITCH_AT) >= RESCUE_LEFT and resets(other, now) + RESCUE_LEAD <= resets(this, now)
 
 
 def choose(names, seen, assigned, pinned, now, exclude=(), current=None):
     """The account for a conversation's next request.
 
-    Accounts are used up one at a time. A conversation keeps its account while that has room, so
-    its prompt cache stays warm; a new one, or one back after its cache expired, joins the account
-    in use while that has room to spare. Either moves early only when another account's weekly
-    quota is clearly closer to going to waste. Otherwise it goes to the account that would waste the most by
-    waiting (soonest weekly reset, most left), preferring ones with room to spare; accounts whose
-    week has not started are kept for later. With every account at its limit it stays put, or
-    takes the one with the most left."""
+    A conversation whose prompt cache is still warm stays on its account until the account refuses
+    it (or starts billing extra usage): on another account its whole context would be paid for again,
+    hundreds of thousands of tokens for a long one, so the last of a window is used up instead. A
+    conversation starting afresh (new, or back after its cache expired) joins the account in use while
+    that has room to spare, unless another account's weekly quota resets clearly sooner; otherwise it
+    goes to the account whose weekly quota resets first, preferring ones with room to spare, with
+    accounts whose week has not started kept for last. With every account at its limit it takes the
+    one with the most left."""
     usable = [n for n in names if n not in exclude and not blocked(seen.get(n), now)]
     if pinned in usable:
         return pinned
+    if assigned in usable and not paying(seen.get(assigned), now):
+        return assigned
     roomy = [n for n in usable if room(seen.get(n), now) > 0]
     if not roomy:
         return assigned if assigned in usable else min(usable, key=lambda n: used(seen.get(n), now), default=None)
-    best = max(roomy, key=lambda n: (room(seen.get(n), now) >= HEADROOM, urgency(seen.get(n), now)))
-
-    def keeps(name, need):
-        return name in roomy and room(seen.get(name), now) >= need and not outruns(seen.get(best), seen.get(name), now)
-    if keeps(assigned, 0):
-        return assigned
-    if keeps(current, HEADROOM):
+    best = min(roomy, key=lambda n: (room(seen.get(n), now) < HEADROOM, resets(seen.get(n), now)))
+    if current in roomy and room(seen.get(current), now) >= HEADROOM and not sooner(seen.get(best), seen.get(current), now):
         return current
     return best
 
@@ -112,12 +106,10 @@ def reason(seen, assigned, name, pinned, now):
     """Why a conversation moved, completing「<assigned>」…"""
     if name == pinned:
         return "手动指定了新账号"
-    if blocked(seen.get(assigned), now):
-        return {"revoked": "的凭证被拒，可能已失效", "burst": "被临时限流"}.get(seen[assigned].get("blocked_for"), "额度已用完")
-    if room(seen.get(assigned), now) <= 0:
-        return "额度快用完"
-    left, seconds = weekly(seen.get(name), now)
-    return f"额度还有，但「{name}」的周额度 {max(1, round(seconds / 3600))} 小时后重置、还剩 {round(left * 100)}% 没用"
+    info = seen.get(assigned) or {}
+    if paying(info, now) and not blocked(info, now):
+        return "开始按超额付费"
+    return {"revoked": "的凭证被拒，可能已失效", "burst": "被临时限流"}.get(info.get("blocked_for"), "额度已用完")
 
 
 def observe(info, headers, status, now):
