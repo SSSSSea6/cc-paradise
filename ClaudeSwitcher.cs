@@ -283,9 +283,9 @@ namespace ClaudeSwitcher
 
     // ---------------------------------------------------------------- sessions --
 
-    /// Code sessions of the main window (the default one, outside the rotation), moved one at a time into
-    /// the rotation window. A session there is only an index file; its conversation is in
-    /// ~/.claude/projects, shared by every window, so moving the file carries the conversation.
+    /// Code sessions moved one at a time between the main window (the default one, outside the
+    /// rotation) and the rotation window. A session there is only an index file; its conversation is
+    /// in ~/.claude/projects, shared by every window, so moving the file carries the conversation.
     /// Claude reads these files when it starts, so a moved session shows after a restart.
     public static class Sessions
     {
@@ -340,7 +340,68 @@ namespace ClaudeSwitcher
         {
             string text = System.Text.RegularExpressions.Regex.Replace(File.ReadAllText(entry.File), "\"isArchived\"\\s*:\\s*true", "\"isArchived\":false");
             File.WriteAllText(Path.Combine(target, Path.GetFileName(entry.File)), text, new UTF8Encoding(false));
-            Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(entry.File, Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs, Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
+            Recycle(entry.File);
+        }
+
+        // What only the window a session was made in knows: its links to that window's other
+        // sessions, its remote-control and browser tab ids, and snapshots of its tools and prompt,
+        // which Claude makes again for the window that opens the session next.
+        static readonly string[] WindowOnly =
+        {
+            "spawnedFrom", "forkedFromSessionId", "forkedAtMessageUuid", "sideSessionNotes", "queuedSideSessionNotes",
+            "peerMessaged", "peerReceipts", "bridgeSessionIds", "chromeTabGroupId", "terminalClaudeTabOrdinal",
+            "toolSurfaceSnapshot", "promptAppendSnapshot", "adoptedFromOtherSurface",
+        };
+
+        /// Moves a rotation-window session into the main window as one of its own: the index goes to
+        /// the main account's store without what only the rotation window knows, and takes the main
+        /// window's connectors. A scratch folder the rotation window made for it moves to the main
+        /// window's scratch folders, and its conversation files move along, since Claude Code keeps
+        /// them in a folder named after the working directory.
+        public static void MoveToMain(Entry entry, string fromProfile, string fromStore, string toProfile, string toStore, string projects)
+        {
+            var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+            var index = (Dictionary<string, object>)serializer.DeserializeObject(File.ReadAllText(entry.File));
+            foreach (string key in WindowOnly) index.Remove(key);
+            object connectors = Directory.GetFiles(toStore, "local_*.json").OrderByDescending(File.GetLastWriteTime)
+                .Select(f => Json.Get(Json.Read(f), "remoteMcpServersConfig")).FirstOrDefault(c => c != null);
+            if (connectors != null) index["remoteMcpServersConfig"] = connectors;
+            string text = serializer.Serialize(index);
+
+            string fromScratch = Scratch(fromProfile, fromStore), toScratch = Scratch(toProfile, toStore);
+            string cwd = Json.Text(index, "cwd");
+            if (cwd != null && cwd.StartsWith(fromScratch + "\\", StringComparison.OrdinalIgnoreCase))
+            {
+                string moved = toScratch + cwd.Substring(fromScratch.Length);
+                Directory.CreateDirectory(toScratch);
+                if (Directory.Exists(cwd)) Directory.Move(cwd, moved); else Directory.CreateDirectory(moved);
+                string from = Path.Combine(projects, Folder(cwd)), to = Path.Combine(projects, Folder(moved));
+                Directory.CreateDirectory(to);
+                var conversations = new[] { Json.Text(index, "cliSessionId") }.Concat((Json.Get(index, "priorCliSessionIds") as object[] ?? new object[0]).OfType<string>());
+                foreach (string id in conversations.Where(i => i != null))
+                {
+                    if (File.Exists(Path.Combine(from, id + ".jsonl"))) File.Move(Path.Combine(from, id + ".jsonl"), Path.Combine(to, id + ".jsonl"));
+                    if (Directory.Exists(Path.Combine(from, id))) Directory.Move(Path.Combine(from, id), Path.Combine(to, id));
+                }
+                text = text.Replace(serializer.Serialize(fromScratch).Trim('"'), serializer.Serialize(toScratch).Trim('"'));
+            }
+            File.WriteAllText(Path.Combine(toStore, Path.GetFileName(entry.File)), text, new UTF8Encoding(false));
+            Recycle(entry.File);
+        }
+
+        // A window's scratch folders for the account a store belongs to: …\scratch-workspaces\<account>\<organization>.
+        static string Scratch(string profile, string store)
+        {
+            return Path.Combine(profile, "scratch-workspaces", Path.GetFileName(Path.GetDirectoryName(store)), Path.GetFileName(store));
+        }
+
+        /// The folder Claude Code keeps a working directory's conversations in: the path with every
+        /// character other than a letter or digit turned into "-".
+        public static string Folder(string cwd) { return System.Text.RegularExpressions.Regex.Replace(cwd, "[^a-zA-Z0-9]", "-"); }
+
+        static void Recycle(string file)
+        {
+            Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(file, Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs, Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
         }
 
         /// "3 小时前", for the menu.
@@ -1332,6 +1393,66 @@ namespace ClaudeSwitcher
             OpenRotationWindow();
         }
 
+        // The main window's processes: the desktop app's claude.exe started without a data folder of its own.
+        static Process[] MainWindowProcesses()
+        {
+            string app = Path.GetDirectoryName(Paths.ClaudeExe);
+            return Process.GetProcessesByName("claude").Where(p =>
+            {
+                string line = Native.CommandLine(p.Id);
+                return line != null && line.IndexOf(app, StringComparison.OrdinalIgnoreCase) >= 0 && !line.Contains("--user-data-dir");
+            }).ToArray();
+        }
+
+        static void RestartMainWindow()
+        {
+            foreach (var p in MainWindowProcesses().Where(p => !Native.CommandLine(p.Id).Contains("--type="))) using (p) { p.Kill(); p.WaitForExit(10000); }
+            var until = DateTime.Now.AddSeconds(10);
+            while (DateTime.Now < until && MainWindowProcesses().Length > 0) Thread.Sleep(200);
+            Process.Start(Paths.ClaudeExe).Dispose();
+        }
+
+        void MoveSessionToMain(Sessions.Entry entry)
+        {
+            if (Sessions.Replying(entry, Sessions.Projects))
+            {
+                MessageBox.Show("「" + entry.Title + "」正在轮换窗口里回复，等它停下来再移。", Program.Title, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            string target = Sessions.MainStore;
+            if (target == null) throw new InvalidOperationException("没找到主窗口的会话目录，先打开一次主窗口的编程页。");
+            Sessions.MoveToMain(entry, Paths.RotationProfile, Sessions.RotationStore, Paths.MainProfile, target, Sessions.Projects);
+            const string Leftover = "轮换窗口里它还会显示到那个窗口下次重启，别在那边接着聊。";
+            if (MainWindowProcesses().Length == 0)
+            {
+                MessageBox.Show("已把「" + entry.Title + "」移到主窗口，打开主窗口就能接着聊。\r\n\r\n" + Leftover, Program.Title, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (MessageBox.Show("已把「" + entry.Title + "」移到主窗口。\r\n\r\n主窗口要重启一次才会显示它。现在重启吗？主窗口里正在回复的会话会被打断，重启后可以接着聊。\r\n\r\n" + Leftover,
+                                Program.Title, MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                RestartMainWindow();
+        }
+
+        // A submenu listing a window's recent sessions, read only when opened: index files run to megabytes.
+        void SessionMenu(ToolStripItemCollection items, string text, Func<string> store, string empty, Action<Sessions.Entry> move)
+        {
+            var menuItem = Add(items, text);
+            Add(menuItem.DropDownItems, "读取中…", enabled: false);
+            menuItem.DropDownOpening += (s, e) =>
+            {
+                menuItem.DropDownItems.Clear();
+                string folder = store();
+                Sessions.Entry[] recent = folder == null ? new Sessions.Entry[0] : Sessions.Recent(folder, 15);
+                if (recent.Length == 0) Add(menuItem.DropDownItems, empty, enabled: false);
+                foreach (var entry in recent)
+                {
+                    var picked = entry;
+                    var item = Add(menuItem.DropDownItems, entry.Title.Length > 28 ? entry.Title.Substring(0, 27) + "…" : entry.Title, () => Program.Safely(() => move(picked)));
+                    item.ShortcutKeyDisplayString = Sessions.Ago(entry.Active);
+                }
+            };
+        }
+
         void ImportSession(Sessions.Entry entry)
         {
             if (Sessions.Replying(entry, Sessions.Projects))
@@ -1373,22 +1494,8 @@ namespace ClaudeSwitcher
 
             Add(items, names.Length == 0 ? "还没有轮换账号" : paused ? "轮换已暂停" : current != null ? "轮换中 · 正在用「" + current + "」" : "轮换中", enabled: false);
             Add(items, "打开轮换窗口", () => Program.Safely(OpenRotationWindow));
-            // Read only when opened: the main window's index files run to megabytes.
-            var sessions = Add(items, "从主账号导入会话");
-            Add(sessions.DropDownItems, "读取中…", enabled: false);
-            sessions.DropDownOpening += (s, e) =>
-            {
-                sessions.DropDownItems.Clear();
-                string mainStore = Sessions.MainStore;
-                Sessions.Entry[] recent = mainStore == null ? new Sessions.Entry[0] : Sessions.Recent(mainStore, 15);
-                if (recent.Length == 0) Add(sessions.DropDownItems, "主账号里没有可导入的会话", enabled: false);
-                foreach (var entry in recent)
-                {
-                    var picked = entry;
-                    var item = Add(sessions.DropDownItems, entry.Title.Length > 28 ? entry.Title.Substring(0, 27) + "…" : entry.Title, () => Program.Safely(() => ImportSession(picked)));
-                    item.ShortcutKeyDisplayString = Sessions.Ago(entry.Active);
-                }
-            };
+            SessionMenu(items, "从主账号导入会话", () => Sessions.MainStore, "主账号里没有可导入的会话", ImportSession);
+            SessionMenu(items, "把会话移到主窗口", () => Sessions.RotationStore, "轮换窗口里没有可移的会话", MoveSessionToMain);
             items.Add(new ToolStripSeparator());
             if (names.Length > 0)
             {
