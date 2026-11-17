@@ -9,8 +9,8 @@
 ## 它做什么
 
 - **轮换窗口**：用单独数据目录打开的 Claude 桌面端，有自己独立的任务栏按钮。只有这个窗口的请求经过本机代理。
-- **自动选号**：账号一个一个用。换号会让整段上下文在新账号上重新计费，所以正在聊的会话一直用当前账号，直到被拒才换号重发（被拒的请求不扣额度）。新会话和闲置超过 1 小时的会话（缓存已经失效）跟着正在用的账号走；那个账号快到上限（用到 95%），或者另一个账号的周额度早一天以上重置、还剩 20% 以上时，就去用周额度最先重置的账号，免得额度作废。
-- **额度悬浮条**：常驻在屏幕下方，可以拖进任务栏，会自动吸附到边缘。显示当前账号 5 小时和本周的剩余额度。单击弹出全部账号的额度和刷新倒计时，右键是管理菜单。有窗口全屏时自动隐藏。
+- **自动选号**：账号一个一个用。换号会让整段上下文在新账号上重新计费，所以正在聊的会话一直用当前账号，直到被拒才换号重发（被拒的请求不扣额度）。新会话和闲置超过 1 小时的会话（缓存已经失效）跟着正在用的账号走；那个账号快到上限（用到 95%），或者另一个账号的周额度早一天以上作废、还剩 20% 以上时，就去用周额度最先作废的账号。周额度在每周重置时作废；订阅按月续期，续期比周重置来得早的，按续期那刻算（不续订的话剩下的额度就没了）。订阅失效、被拒的账号自动暂停。
+- **额度悬浮条**：常驻在屏幕下方，可以拖进任务栏，会自动吸附到边缘。显示当前账号 5 小时和本周的剩余额度。单击弹出全部账号的额度、刷新倒计时和订阅到期时间（按订阅开始那天每月推算；自动续费后显示下个月的），右键是管理菜单。有窗口全屏时自动隐藏。
 - **托盘**：图标上显示当前账号的剩余百分比，切号时弹提示。
 - **在两个窗口之间移会话**：把默认窗口里的编程会话移到轮换窗口接着聊，或者反过来，把轮换窗口的会话移成默认窗口自己的会话。
 
@@ -35,7 +35,7 @@
 3. 右键 → **打开轮换窗口**，在里面登录一次（用哪个账号都行）。
 4. 添加要轮换的账号，任选一种：
    - **从已登录的窗口导入**：默认窗口、轮换窗口，或者其他用 `--user-data-dir` 打开过、已经登录的 Claude 数据目录。
-   - **用新登录添加账号**：程序会运行 `claude setup-token`，在浏览器里登录，再把显示的令牌粘贴回来。
+   - **用新登录添加账号**：程序会运行 `claude setup-token`，在浏览器里登录，再把显示的令牌粘贴回来。这种令牌查不到订阅开始的时间，选号时就不考虑它的续期日。
 5. 可选：右键 → **开机启动**。如果想要“直接打开轮换窗口”的快捷方式，目标填 `ClaudeSwitcher.exe --open-window`，命名为 `Claude 轮换`，放在桌面或开始菜单。程序会给它打上和轮换窗口相同的任务栏标识。
 
 想继续用一个现成的 Claude 数据目录当轮换窗口，在 `%LOCALAPPDATA%\ClaudeSwitcher\pool.json` 里加上 `"rotation_profile": "那个目录的完整路径"`，然后重启托盘。
@@ -98,7 +98,7 @@ ClaudeSwitcher rotates several Claude subscription accounts behind the Claude de
 - Quota is read from the `anthropic-ratelimit-unified-*` response headers. The proxy never sends requests of its own.
 - Tokens are stored encrypted with Windows DPAPI.
 
-**Account selection**: accounts are used up one at a time. Moving a session to another account means paying for its whole context again, so a session with a warm prompt cache stays on its account until a request is rejected, which is then retried on the next account. New sessions, and sessions idle long enough for their cache to expire, join the account in use. They go elsewhere when that account is near its limit (95%), or when another account's weekly quota resets at least a day sooner with 20% or more left; the account whose weekly quota resets first comes first.
+**Account selection**: accounts are used up one at a time. Moving a session to another account means paying for its whole context again, so a session with a warm prompt cache stays on its account until a request is rejected, which is then retried on the next account. New sessions, and sessions idle long enough for their cache to expire, join the account in use. They go elsewhere when that account is near its limit (95%), or when another account's weekly quota is lost at least a day sooner with 20% or more left; the account whose weekly quota is lost first comes first. Weekly quota is lost at the weekly reset, or at the monthly subscription renewal if that comes first (if the subscription is not renewed, what is left goes with it). Accounts whose subscription has ended or whose token is refused are paused.
 
 **Requirements**: Windows 10/11 with Claude Desktop, Python 3.10+ on PATH with `pip install cryptography`, and .NET Framework 4.8 (built into Windows).
 
@@ -106,7 +106,7 @@ ClaudeSwitcher rotates several Claude subscription accounts behind the Claude de
 
 1. Run `build.cmd`, then run `ClaudeSwitcher.exe`.
 2. Right-click the tray icon or the floating bar → *打开轮换窗口* (open rotation window), and sign in once.
-3. Add accounts with *从已登录的窗口导入* (import a signed-in Claude data folder) or *用新登录添加账号* (sign in with `claude setup-token`).
+3. Add accounts with *从已登录的窗口导入* (import a signed-in Claude data folder) or *用新登录添加账号* (sign in with `claude setup-token`; such a token cannot read when the subscription began, so its renewal date is not taken into account).
 
 **Data**: all private data lives in `%LOCALAPPDATA%\ClaudeSwitcher`: tokens, certificates, state, logs, and the rotation window's profile. Nothing private is kept in the code folder.
 

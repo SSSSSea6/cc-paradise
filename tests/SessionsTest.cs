@@ -7,6 +7,12 @@ static class T {
     static int failed;
     static void Check(string name, bool ok) { Console.WriteLine((ok ? "PASS " : "FAIL ") + name); if (!ok) failed++; }
     static int Main(string[] args) {
+        Func<string, long> at = text => DateTimeOffset.Parse(text + "Z").ToUnixTimeSeconds();
+        Check("订阅续期：下一个同日同时刻，和代理算的一样", Quota.Renews("2026-10-19T09:44:11.321544Z", at("2026-11-17T00:00:00")) == at("2026-11-19T09:44:11"));
+        Check("订阅续期：过了这个月的就算下个月", Quota.Renews("2026-10-19T09:44:11Z", at("2026-11-19T09:44:12")) == at("2026-12-19T09:44:11"));
+        Check("订阅续期：月份没有那天取月底", Quota.Renews("2026-01-31T00:00:00Z", at("2026-02-01T00:00:00")) == at("2026-02-28T00:00:00"));
+        Check("订阅续期：不知道开始时间的不显示", Quota.Renews(null, 0) == 0);
+
         string root = Path.Combine(Path.GetTempPath(), "session-move-test-" + Guid.NewGuid().ToString("N"));
         string main = Path.Combine(root, "main"), rot = Path.Combine(root, "rot"), projects = Path.Combine(root, "projects", "C--work");
         Directory.CreateDirectory(main); Directory.CreateDirectory(rot); Directory.CreateDirectory(projects);

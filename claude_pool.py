@@ -5,17 +5,20 @@ Only the rotation window uses it: that Claude is started with HTTPS_PROXY pointi
 and its Code sessions inherit it. Requests to api.anthropic.com are opened with a local CA;
 /v1/messages calls get the chosen account's token, everything else passes through
 untouched. Quota comes from the anthropic-ratelimit-unified-* headers of the responses
-themselves; the proxy never sends requests of its own.
+themselves; the proxy never sends requests of its own. Adding an account looks up once when
+its subscription began, so quota about to be lost at a renewal is used first.
 
     claude_pool.py serve | trust | pause | resume | remove NAME | pin NAME|auto
                    add NAME (token on stdin) | import NAME DESKTOP_PROFILE_FOLDER
 """
 import base64
+import calendar
 import ctypes
 from ctypes import wintypes
 import datetime
 import http.client
 import http.server
+import itertools
 import json
 import os
 from pathlib import Path
@@ -63,17 +66,33 @@ def room(seen, now):
     return 0 if paying(seen, now) else SWITCH_AT - used(seen, now)
 
 
+def renews(since, now):
+    """The next monthly renewal of a subscription that began at `since`, an ISO time; if it is not
+    renewed, quota left then is lost with it. Unknown (None) never comes."""
+    if not since:
+        return float("inf")
+    start = datetime.datetime.fromisoformat(since.replace("Z", "+00:00"))
+    for months in itertools.count(1):
+        year, month = start.year + (start.month - 1 + months) // 12, (start.month - 1 + months) % 12 + 1
+        at = start.replace(year=year, month=month, day=min(start.day, calendar.monthrange(year, month)[1])).timestamp()
+        if at > now:
+            return at
+
+
 def resets(seen, now):
-    """When the weekly window resets; one not started yet never runs out, so it comes last."""
-    reset = (seen or {}).get("7d", (0, 0))[1]
-    return reset if reset > now else float("inf")
+    """When what is left of the week is lost: the weekly reset, or the subscription's renewal if that
+    comes first. A week not started yet on a subscription not renewing soon never runs out, so it comes last."""
+    seen = seen or {}
+    reset = seen.get("7d", (0, 0))[1]
+    return min(reset if reset > now else float("inf"), seen.get("renews", float("inf")))
 
 
 def sooner(other, this, now):
-    """Whether another account's weekly quota is clearly the one to use first: it resets at least
-    RESCUE_LEAD sooner with RESCUE_LEFT of it still to use. Accounts resetting about together do not
+    """Whether another account's weekly quota is clearly the one to use first: it is lost at least
+    RESCUE_LEAD sooner with RESCUE_LEFT of it still to use. Accounts losing it about together do not
     trade places, so conversations do not bounce between them."""
-    left = 1 - (other or {}).get("7d", (0, 0))[0] if resets(other, now) < float("inf") else 1
+    usage, reset = (other or {}).get("7d", (0, 0))
+    left = 1 - usage if reset > now else 1
     return left - (1 - SWITCH_AT) >= RESCUE_LEFT and resets(other, now) + RESCUE_LEAD <= resets(this, now)
 
 
@@ -84,10 +103,10 @@ def choose(names, seen, assigned, pinned, now, exclude=(), current=None):
     it (or starts billing extra usage): on another account its whole context would be paid for again,
     hundreds of thousands of tokens for a long one, so the last of a window is used up instead. A
     conversation starting afresh (new, or back after its cache expired) joins the account in use while
-    that has room to spare, unless another account's weekly quota resets clearly sooner; otherwise it
-    goes to the account whose weekly quota resets first, preferring ones with room to spare, with
-    accounts whose week has not started kept for last. With every account at its limit it takes the
-    one with the most left."""
+    that has room to spare, unless another account's weekly quota is lost clearly sooner; otherwise it
+    goes to the account whose weekly quota is lost first (at its reset, or at a subscription renewal
+    that comes before it), preferring ones with room to spare, with accounts whose week has not started
+    kept for last. With every account at its limit it takes the one with the most left."""
     usable = [n for n in names if n not in exclude and not blocked(seen.get(n), now)]
     if pinned in usable:
         return pinned
@@ -109,7 +128,7 @@ def reason(seen, assigned, name, pinned, now):
     info = seen.get(assigned) or {}
     if paying(info, now) and not blocked(info, now):
         return "开始按超额付费"
-    return {"revoked": "的凭证被拒，可能已失效", "burst": "被临时限流"}.get(info.get("blocked_for"), "额度已用完")
+    return {"revoked": "的凭证被拒，可能已失效", "lapsed": "的订阅已失效", "burst": "被临时限流"}.get(info.get("blocked_for"), "额度已用完")
 
 
 def observe(info, headers, status, now):
@@ -127,11 +146,12 @@ def observe(info, headers, status, now):
         rejected = header("status") == "rejected"
         info["blocked_until"] = int(header("reset") or now + 300) if rejected else now + 60
         info["blocked_for"] = "quota" if rejected else "burst"
-    elif status == 401:
-        # The token was revoked, e.g. by signing out of that account; set aside for a day,
-        # or until a new token is added for it.
+    elif status in (401, 403):
+        # 401: the token was revoked, e.g. by signing out of that account. 403: the subscription
+        # ended and the account may no longer sign in with OAuth. Set aside for a day, or until a
+        # new token is added for it.
         info["blocked_until"] = now + 86400
-        info["blocked_for"] = "revoked"
+        info["blocked_for"] = "revoked" if status == 401 else "lapsed"
     info["seen"] = now
 
 
@@ -183,6 +203,7 @@ class Pool:
         self.mtime = None
         self.config = {}
         self.tokens = {}
+        self.since = {}
 
     def refresh(self):
         mtime = CONFIG.stat().st_mtime if CONFIG.exists() else None
@@ -191,6 +212,7 @@ class Pool:
             self.config = read_json(CONFIG, {})
             tokens = {a["name"]: dpapi(base64.b64decode(a["token"]), False).decode()
                       for a in self.config.get("accounts", [])}
+            self.since = {a["name"]: a.get("since") for a in self.config.get("accounts", [])}
             # An account added again while running gets a fresh start: a lock set on its old token
             # (a refused one, most likely) says nothing about the new one.
             for name, token in tokens.items():
@@ -207,7 +229,7 @@ class Pool:
             if self.config.get("paused") or not self.tokens:
                 return None, None
             now = time.time()
-            seen = self.state["accounts"]
+            seen = {n: dict(self.state["accounts"].get(n) or {}, renews=renews(self.since[n], now)) for n in self.tokens}
             sessions = {k: v for k, v in self.state.get("sessions", {}).items() if now - v[1] < AFFINITY}
             assigned = sessions.get(session, [None])[0]
             pinned = self.config.get("pinned")
@@ -394,7 +416,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 return
             if name:
                 self.pool.record(name, {k.lower(): v for k, v in response.getheaders()}, response.status)
-                if response.status in (401, 429):
+                if response.status in (401, 403, 429):
                     tried.append(name)
                     if self.pool.pick(session, tried)[0]:
                         response.read()
@@ -487,9 +509,27 @@ def read_desktop_token(folder):
     return max((e for scope, e in entries.items() if "user:inference" in scope), key=lambda e: e["expiresAt"])["token"]
 
 
-def save_account(config, name, token):
-    sealed = base64.b64encode(dpapi(token.encode(), True)).decode()
-    config["accounts"] = [a for a in config["accounts"] if a["name"] != name] + [{"name": name, "token": sealed}]
+def subscribed_since(token):
+    """When the account's subscription began, which fixes its monthly renewals; None when the token
+    may not read the profile, as with a setup-token."""
+    conn = http.client.HTTPSConnection(API, timeout=20)
+    try:
+        conn.request("GET", "/api/oauth/profile", headers={"Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20"})
+        response = conn.getresponse()
+        return json.loads(response.read())["organization"].get("subscription_created_at") if response.status == 200 else None
+    except OSError:
+        return None
+    finally:
+        conn.close()
+
+
+def save_account(config, name, token, since=None):
+    """Adds or replaces an account; one added again keeps the subscription start known for it before."""
+    old = next((a for a in config["accounts"] if a["name"] == name), {})
+    entry = {"name": name, "token": base64.b64encode(dpapi(token.encode(), True)).decode()}
+    if since or old.get("since"):
+        entry["since"] = since or old["since"]
+    config["accounts"] = [a for a in config["accounts"] if a["name"] != name] + [entry]
     write_json(CONFIG, config)
 
 
@@ -516,13 +556,13 @@ def main():
         token = sys.stdin.read().strip()
         if not token.startswith("sk-ant-") or any(c.isspace() for c in token):
             sys.exit("这不像 claude setup-token 给出的令牌（应以 sk-ant- 开头）。")
-        save_account(config, args[0], token)
+        save_account(config, args[0], token, subscribed_since(token))
     elif command == "import":
         try:
             token = read_desktop_token(Path(args[1]))
         except (OSError, KeyError, ValueError):
             sys.exit("这个窗口里没有可用的登录，先打开它登录一次。")
-        save_account(config, args[0], token)
+        save_account(config, args[0], token, subscribed_since(token))
     elif command == "remove":
         config["accounts"] = [a for a in accounts if a["name"] != args[0]]
         if config.get("pinned") == args[0]:

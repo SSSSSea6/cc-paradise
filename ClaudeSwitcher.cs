@@ -586,10 +586,32 @@ namespace ClaudeSwitcher
 
         static string Percent(double left) { return Math.Round(left * 100) + "%"; }
 
-        /// "5小时剩 73%，2小时15分后刷新 · 本周剩 5%，3天4小时后刷新", for the menu.
-        public static string Summary(object seen)
+        /// The next monthly renewal of a subscription that began at `since` (an ISO time), as the
+        /// proxy reckons it; 0 when unknown. A month without that day renews on its last day.
+        public static long Renews(string since, long now)
         {
-            if (seen == null) return "还没用过";
+            DateTimeOffset start;
+            if (!DateTimeOffset.TryParse(since, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal, out start)) return 0;
+            for (int months = 1; ; months++)
+            {
+                long at = start.AddMonths(months).ToUnixTimeSeconds();
+                if (at > now) return at;
+            }
+        }
+
+        static long Renews(object config, string name)
+        {
+            var accounts = Json.Get(config, "accounts") as object[] ?? new object[0];
+            return Renews(Json.Text(accounts.FirstOrDefault(a => Json.Text(a, "name") == name), "since"), Now);
+        }
+
+        /// "5小时剩 73%，2小时15分后刷新 · 本周剩 5%，3天4小时后刷新 · 订阅还剩1天23小时", for the menu.
+        public static string Summary(object config, object state, string name)
+        {
+            object seen = Json.Get(Json.Get(state, "accounts"), name);
+            long renews = Renews(config, name);
+            string subscription = renews > 0 ? "订阅还剩" + Until(renews) : null;
+            if (seen == null) return subscription != null ? "还没用过 · " + subscription : "还没用过";
             var parts = new List<string>();
             foreach (var window in new[] { new[] { "5h", "5小时" }, new[] { "7d", "本周" } })
             {
@@ -597,6 +619,7 @@ namespace ClaudeSwitcher
                 double left = Window(seen, window[0], out reset);
                 parts.Add(window[1] + "剩 " + Percent(left) + (reset > 0 ? "，" + Until(reset) + "后刷新" : ""));
             }
+            if (subscription != null) parts.Add(subscription);
             return string.Join(" · ", parts) + (Json.Number(seen, "blocked_until") > Now ? "（" + Paused(seen) + "）" : "");
         }
 
@@ -607,6 +630,7 @@ namespace ClaudeSwitcher
             switch (Json.Text(seen, "blocked_for"))
             {
                 case "revoked": return "凭证被拒，重新添加后恢复";
+                case "lapsed": return "订阅已失效，续订后重新添加";
                 case "burst": return "被临时限流，" + until + "后恢复";
                 default: return "额度已用完，" + until + "后恢复";
             }
@@ -624,6 +648,12 @@ namespace ClaudeSwitcher
                 if (name == Json.Text(config, "pinned")) tags.Add("已固定");
                 if (Json.Number(seen, "blocked_until") > Now) { tags = new List<string> { Paused(seen) }; row.Alert = true; }
                 if (tags.Count > 0) row.Tag = string.Join(" · ", tags);
+                long renews = Renews(config, name);
+                if (renews > 0)
+                {
+                    row.Renewal = DateTimeOffset.FromUnixTimeSeconds(renews).LocalDateTime.ToString("M月d日 HH:mm") + " 到期";
+                    row.RenewalLeft = "还剩" + Until(renews);
+                }
                 if (seen == null) row.Note = "还没用过，额度未知";
                 else
                 {
@@ -653,6 +683,7 @@ namespace ClaudeSwitcher
         public bool Alert;                      // the tag is a warning
         public double[] Left = { 1, 1 };        // share left of the 5-hour and weekly windows
         public string[] Reset = new string[2];
+        public string Renewal, RenewalLeft;     // when the subscription comes up for renewal, if known
     }
 
     public static class Look
@@ -726,7 +757,7 @@ namespace ClaudeSwitcher
 
             int n = rows.Length;
             float height = Pad + 22 + 10 + Math.Max(0, n - 1) * 13 + (n > 0 ? 10 : 0) + 18 + Pad;
-            foreach (Row row in rows) height += row.Note != null ? 42 : 62;
+            foreach (Row row in rows) height += (row.Note != null ? 42 : 62) + (row.Renewal != null ? 20 : 0);
             var bmp = new Bitmap((int)Math.Ceiling((Width + 2 * Margin) * scale), (int)Math.Ceiling((height + 2 * Margin) * scale), PixelFormat.Format32bppArgb);
             using (var g = Graphics.FromImage(bmp))
             using (var heading = new Font("Microsoft YaHei UI", 14, FontStyle.Bold, GraphicsUnit.Pixel))
@@ -771,9 +802,8 @@ namespace ClaudeSwitcher
                     {
                         Text(g, row.Note, body, muted, x0, y, 20, false);
                         y += 20;
-                        continue;
                     }
-                    for (int k = 0; k < 2; k++)
+                    for (int k = 0; k < 2 && row.Note == null; k++)
                     {
                         Text(g, k == 0 ? "5小时" : "本周", body, muted, x0, y, 20, false);
                         var bar = new RectangleF(x0 + 44, y + 7, 108, 6);
@@ -782,6 +812,13 @@ namespace ClaudeSwitcher
                         if (filled > 0) Look.Fill(g, new RectangleF(bar.X, bar.Y, Math.Max(filled, bar.Height), bar.Height), 3, Look.Level(row.Left[k], dark));
                         Text(g, Math.Round(row.Left[k] * 100) + "%", strong, ink, x0 + 196, y, 20, true);
                         Text(g, row.Reset[k], body, muted, x1, y, 20, true);
+                        y += 20;
+                    }
+                    if (row.Renewal != null)
+                    {
+                        Text(g, "订阅", body, muted, x0, y, 20, false);
+                        Text(g, row.Renewal, body, ink, x0 + 44, y, 20, false);
+                        Text(g, row.RenewalLeft, body, muted, x1, y, 20, true);
                         y += 20;
                     }
                 }
@@ -1504,7 +1541,7 @@ namespace ClaudeSwitcher
                 {
                     string picked = name;
                     var item = Add(items, name + (name == current ? "（正在用）" : ""), () => Program.Safely(() => Pool.Invoke(null, "pin", picked)), check: name == pinned);
-                    item.ShortcutKeyDisplayString = Quota.Summary(Json.Get(Json.Get(state, "accounts"), name));
+                    item.ShortcutKeyDisplayString = Quota.Summary(config, state, name);
                 }
                 items.Add(new ToolStripSeparator());
             }

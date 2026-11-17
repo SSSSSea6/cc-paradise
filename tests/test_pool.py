@@ -122,6 +122,35 @@ def _():
     assert pool.choose(["A", "B"], seen, "A", None, NOW + 61) == "B"
 
 
+@test("订阅失效的 403 锁一天，记作订阅失效")
+def _():
+    lapsed = {}
+    pool.observe(lapsed, {}, 403, NOW)
+    assert lapsed["blocked_until"] == NOW + 86400 and lapsed["blocked_for"] == "lapsed"
+    assert pool.reason({"A": lapsed}, "A", "B", None, NOW) == "的订阅已失效"
+    assert pool.choose(["A", "B"], {"A": lapsed}, "A", None, NOW) == "B"
+
+
+@test("订阅按月续期：从开始那天算到下一个同日，月份没有那天就取月底；不知道开始时间的不算")
+def _():
+    at = lambda text: pool.datetime.datetime.fromisoformat(text + "+00:00").timestamp()
+    assert pool.renews("2026-10-19T09:44:11.321544Z", at("2026-11-17T00:00:00")) == at("2026-11-19T09:44:11.321544")
+    assert pool.renews("2026-10-19T09:44:11Z", at("2026-11-19T09:44:12")) == at("2026-12-19T09:44:11")
+    assert pool.renews("2026-01-31T00:00:00Z", at("2026-02-01T00:00:00")) == at("2026-02-28T00:00:00")
+    assert pool.renews(None, NOW) == float("inf")
+
+
+@test("续期比周重置来得早的账号，周额度按续期那刻作废算，新会话先用它")
+def _():
+    seen = {"A": {"7d": [0.3, NOW + 3 * DAY]}, "B": {"7d": [0.11, NOW + 4 * DAY], "renews": NOW + DAY}}
+    assert pool.choose(["A", "B"], seen, None, None, NOW, current="A") == "B"
+    assert pool.choose(["A", "B"], seen, "A", None, NOW, current="A") == "A"
+    seen["B"] = {"renews": NOW + DAY}  # its week has not started: all of it goes at the renewal
+    assert pool.choose(["A", "B"], seen, None, None, NOW, current="A") == "B"
+    seen["B"]["renews"] = NOW + 2.5 * DAY  # lost about when A's is: no reason to move
+    assert pool.choose(["A", "B"], seen, None, None, NOW, current="A") == "A"
+
+
 @test("固定的账号优先，被锁住时照常挑别的")
 def _():
     seen = {"B": {"5h": [0.99, NOW + 99]}}
@@ -273,6 +302,19 @@ def _():
     assert keeper.pick("s1")[0] == "B"
     pool.write_json(pool.CONFIG, {"pinned": "A", "accounts": accounts("new")})
     assert keeper.pick("s1")[0] == "A"
+
+
+@test("账号记下的订阅开始时间参与选号；重新添加时查不到就沿用原来的")
+def _():
+    seal = lambda token: base64.b64encode(pool.dpapi(token.encode(), True)).decode()
+    tomorrow = pool.datetime.datetime.fromtimestamp(time.time() + DAY, pool.datetime.timezone.utc)
+    since = tomorrow.replace(month=tomorrow.month - 1 or 12, year=tomorrow.year - (tomorrow.month == 1)).isoformat()
+    pool.write_json(pool.CONFIG, {"accounts": [{"name": "A", "token": seal("a")}, {"name": "B", "token": seal("b"), "since": since}]})
+    pool.write_json(pool.STATE, {"current": "A", "accounts": {"A": {"7d": [0.3, time.time() + 3 * DAY]}}, "switch": None})
+    assert pool.Pool().pick("s1")[0] == "B"
+    config = pool.read_json(pool.CONFIG, {})
+    pool.save_account(config, "B", "b2")
+    assert next(a for a in config["accounts"] if a["name"] == "B")["since"] == since
 
 
 print(f"RESULT failed={failed}")
