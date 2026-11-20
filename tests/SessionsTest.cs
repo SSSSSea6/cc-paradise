@@ -12,6 +12,14 @@ static class T {
         Check("订阅续期：过了这个月的就算下个月", Quota.Renews("2026-10-19T09:44:11Z", at("2026-11-19T09:44:12")) == at("2026-12-19T09:44:11"));
         Check("订阅续期：月份没有那天取月底", Quota.Renews("2026-01-31T00:00:00Z", at("2026-02-01T00:00:00")) == at("2026-02-28T00:00:00"));
         Check("订阅续期：不知道开始时间的不显示", Quota.Renews(null, 0) == 0);
+        {
+            var serializer = new System.Web.Script.Serialization.JavaScriptSerializer();
+            object config = serializer.DeserializeObject("{\"accounts\":[{\"name\":\"A\",\"since\":\"2026-10-19T09:44:11Z\"}]}");
+            object state = serializer.DeserializeObject("{\"accounts\":{\"A\":{\"seen\":1,\"blocked_until\":1,\"blocked_for\":\"lapsed\"}}}");
+            var row = Quota.Rows(config, state)[0];
+            Check("订阅失效：暂停期过了也一直显示失效，不显示推算的到期日", row.Alert && row.Tag == "订阅已失效，续订后重新添加" && row.Renewal == null
+                  && Quota.Summary(config, state, "A").EndsWith("（订阅已失效，续订后重新添加）") && !Quota.Summary(config, state, "A").Contains("订阅还剩"));
+        }
 
         string root = Path.Combine(Path.GetTempPath(), "session-move-test-" + Guid.NewGuid().ToString("N"));
         string main = Path.Combine(root, "main"), rot = Path.Combine(root, "rot"), projects = Path.Combine(root, "projects", "C--work");

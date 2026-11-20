@@ -609,7 +609,7 @@ namespace ClaudeSwitcher
         public static string Summary(object config, object state, string name)
         {
             object seen = Json.Get(Json.Get(state, "accounts"), name);
-            long renews = Renews(config, name);
+            long renews = Lapsed(seen) ? 0 : Renews(config, name);
             string subscription = renews > 0 ? "订阅还剩" + Until(renews) : null;
             if (seen == null) return subscription != null ? "还没用过 · " + subscription : "还没用过";
             var parts = new List<string>();
@@ -620,8 +620,14 @@ namespace ClaudeSwitcher
                 parts.Add(window[1] + "剩 " + Percent(left) + (reset > 0 ? "，" + Until(reset) + "后刷新" : ""));
             }
             if (subscription != null) parts.Add(subscription);
-            return string.Join(" · ", parts) + (Json.Number(seen, "blocked_until") > Now ? "（" + Paused(seen) + "）" : "");
+            return string.Join(" · ", parts) + (SetAside(seen) ? "（" + Paused(seen) + "）" : "");
         }
+
+        /// A lapsed subscription stays shown as lapsed after its pause runs out, until a request
+        /// on the account succeeds again.
+        public static bool Lapsed(object seen) { return Json.Text(seen, "blocked_for") == "lapsed"; }
+
+        public static bool SetAside(object seen) { return Json.Number(seen, "blocked_until") > Now || Lapsed(seen); }
 
         /// Why an account is set aside: a refused token is fixed by adding the account again.
         public static string Paused(object seen)
@@ -646,9 +652,9 @@ namespace ClaudeSwitcher
                 var tags = new List<string>();
                 if (name == Json.Text(state, "current")) tags.Add("正在用");
                 if (name == Json.Text(config, "pinned")) tags.Add("已固定");
-                if (Json.Number(seen, "blocked_until") > Now) { tags = new List<string> { Paused(seen) }; row.Alert = true; }
+                if (SetAside(seen)) { tags = new List<string> { Paused(seen) }; row.Alert = true; }
                 if (tags.Count > 0) row.Tag = string.Join(" · ", tags);
-                long renews = Renews(config, name);
+                long renews = Lapsed(seen) ? 0 : Renews(config, name);
                 if (renews > 0)
                 {
                     row.Renewal = DateTimeOffset.FromUnixTimeSeconds(renews).LocalDateTime.ToString("M月d日 HH:mm") + " 到期";
