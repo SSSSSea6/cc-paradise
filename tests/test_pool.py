@@ -1,5 +1,6 @@
 """Tests for claude_pool.py: python test_pool.py [path to claude_pool.py]"""
 import base64
+import gzip
 import http.client
 import http.server
 import importlib.util
@@ -122,13 +123,18 @@ def _():
     assert pool.choose(["A", "B"], seen, "A", None, NOW + 61) == "B"
 
 
-@test("订阅失效的 403 锁一天，记作订阅失效")
+@test("订阅失效的 403 锁一天，记作订阅失效；别的 403 不算账号的问题；请求成功就解除暂停")
 def _():
     lapsed = {}
-    pool.observe(lapsed, {}, 403, NOW)
+    pool.observe(lapsed, {}, 403, NOW, b'{"error":{"message":"OAuth authentication is currently not allowed for this organization."}}')
     assert lapsed["blocked_until"] == NOW + 86400 and lapsed["blocked_for"] == "lapsed"
     assert pool.reason({"A": lapsed}, "A", "B", None, NOW) == "的订阅已失效"
     assert pool.choose(["A", "B"], {"A": lapsed}, "A", None, NOW) == "B"
+    other = {}
+    pool.observe(other, {}, 403, NOW, b'{"error":{"message":"Request not allowed"}}')
+    assert "blocked_until" not in other and "blocked_for" not in other
+    pool.observe(lapsed, {}, 200, NOW + 99)
+    assert "blocked_until" not in lapsed and "blocked_for" not in lapsed
 
 
 @test("订阅按月续期：从开始那天算到下一个同日，月份没有那天就取月底；不知道开始时间的不算")
@@ -187,7 +193,17 @@ def _():
 
         def do_POST(self):
             self.rfile.read(int(self.headers["Content-Length"]))
-            received.append((self.path, self.headers["Authorization"], self.client_address[1]))
+            received.append((self.path, self.headers["Authorization"], self.client_address[1], self.headers["Accept-Encoding"]))
+            if "forbidden" in self.path:  # gzipped as the API sends it; for token-a, the refusal of an ended subscription
+                ended = self.headers["Authorization"] == "Bearer token-a"
+                payload = gzip.compress(b'{"error":{"message":"OAuth authentication is currently not allowed for this organization."}}'
+                                        if ended else b'{"error":{"message":"Request not allowed"}}')
+                self.send_response(403)
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             if self.path == "/plain":  # a body sent with a length, as error replies are
                 self.send_response(400)
                 self.send_header("Content-Length", "2")
@@ -249,6 +265,20 @@ def _():
         reply = client.getresponse()
         assert reply.status == 400 and reply.read() == b"{}"
     assert received[-1][2] == received[-2][2], received[-2:]
+
+
+@test("订阅失效的 403 换号重发；别的 403 原样转回、不暂停账号；转发时只接受 gzip")
+def _():
+    pool.write_json(pool.STATE, {"current": "A", "accounts": {}, "switch": None, "sessions": {"s9": ["A", time.time()]}})
+    pool.ApiHandler.pool = pool.Pool()
+    client = connect()
+    client.request("POST", "/v1/messages?forbidden", body=b"{}", headers={"Authorization": "Bearer desktop", "X-Claude-Code-Session-Id": "s9", "Accept-Encoding": "gzip, deflate, br"})
+    reply = client.getresponse()
+    assert reply.status == 403 and gzip.decompress(reply.read()) == b'{"error":{"message":"Request not allowed"}}'
+    assert [(r[1], r[3]) for r in received[-2:]] == [("Bearer token-a", "gzip"), ("Bearer token-b", "gzip")], received[-2:]
+    accounts = json.loads(pool.STATE.read_text(encoding="utf-8"))["accounts"]
+    assert accounts["A"]["blocked_for"] == "lapsed" and "blocked_until" not in accounts["B"]
+    assert "B refused with 403" in pool.LOG.read_text(encoding="utf-8")
 
 
 @test("网络出错（不只是连接被关）时代理用新连接重试，请求照常成功")

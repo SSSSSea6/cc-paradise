@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 import traceback
+import zlib
 
 HOME = Path(os.environ["LOCALAPPDATA"]) / "ClaudeSwitcher"  # tokens, certificates and state; never next to the code
 CONFIG = HOME / "pool.json"
@@ -41,6 +42,7 @@ SWITCH_AT = 0.95                      # a conversation starting afresh avoids ac
 HEADROOM = 0.10                       # and wants at least this much room
 AFFINITY = 3600                       # a conversation idle this long has lost its prompt cache anyway
 RESCUE_LEAD, RESCUE_LEFT = 24 * 3600, 0.20  # weekly quota resetting this much sooner, with this much left, goes first
+LAPSED = b"OAuth authentication is currently not allowed"  # the 403 an account gets once its subscription ends
 KEEP = 240                            # seconds an idle API connection is kept for reuse (the API keeps them 5+ minutes)
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-connection", "content-length"}
 
@@ -131,7 +133,7 @@ def reason(seen, assigned, name, pinned, now):
     return {"revoked": "的凭证被拒，可能已失效", "lapsed": "的订阅已失效", "burst": "被临时限流"}.get(info.get("blocked_for"), "额度已用完")
 
 
-def observe(info, headers, status, now):
+def observe(info, headers, status, now, body=b""):
     """Folds one response's quota headers into what is known of an account."""
     def header(name):
         return headers.get("anthropic-ratelimit-unified-" + name)
@@ -141,15 +143,19 @@ def observe(info, headers, status, now):
     if header("overage-in-use") == "true":
         # Included quota is gone and the request was billed as extra usage; prefer the others until it resets.
         info["overage_until"] = int(header("reset") or now + 3600)
-    if status == 429:
+    if status < 400:
+        info.pop("blocked_until", None)
+        info.pop("blocked_for", None)
+    elif status == 429:
         # Out of quota: rejected until the window resets. Any other 429 is a short burst limit.
         rejected = header("status") == "rejected"
         info["blocked_until"] = int(header("reset") or now + 300) if rejected else now + 60
         info["blocked_for"] = "quota" if rejected else "burst"
-    elif status in (401, 403):
-        # 401: the token was revoked, e.g. by signing out of that account. 403: the subscription
-        # ended and the account may no longer sign in with OAuth. Set aside for a day, or until a
-        # new token is added for it.
+    elif status == 401 or status == 403 and LAPSED in body:
+        # The token was revoked, e.g. by signing out of that account, or the subscription ended and
+        # the account may no longer sign in with OAuth. Set aside for a day, until a request on it
+        # succeeds, or until a new token is added for it. Other 403s come from the network path,
+        # not the account.
         info["blocked_until"] = now + 86400
         info["blocked_for"] = "revoked" if status == 401 else "lapsed"
     info["seen"] = now
@@ -245,10 +251,13 @@ class Pool:
             write_json(STATE, self.state)
             return name, self.tokens.get(name)
 
-    def record(self, name, headers, status):
+    def record(self, name, headers, status, body=b""):
+        """Whether the account is now set aside."""
         with self.lock:
-            observe(self.state["accounts"].setdefault(name, {}), headers, status, time.time())
+            info = self.state["accounts"].setdefault(name, {})
+            observe(info, headers, status, time.time(), body)
             write_json(STATE, self.state)
+            return blocked(info, time.time())
 
 
 # -------------------------------------------------------------------- proxy --
@@ -381,7 +390,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         else:
             self.upstream.give(conn)
 
-    def relay(self, response):
+    def relay(self, response, content=None):
         self.send_response(response.status)
         no_body = self.command == "HEAD" or response.status in (204, 304)
         for key, value in response.getheaders():
@@ -392,7 +401,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             return
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
-        while chunk := response.read1(65536):
+        for chunk in [content] if content else iter(lambda: response.read1(65536), b""):
             self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
             self.wfile.flush()
         self.wfile.write(b"0\r\n\r\n")
@@ -401,10 +410,15 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
     def forward(self):
         body = self.read_body()
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
+        pooled = self.path.startswith("/v1/messages")
+        if pooled and "gzip" in self.headers.get("Accept-Encoding", ""):
+            # A refusal is read to tell an ended subscription from other 403s, and only gzip unpacks here.
+            headers = {k: v for k, v in headers.items() if k.lower() != "accept-encoding"}
+            headers["Accept-Encoding"] = "gzip"
         session = self.headers.get("X-Claude-Code-Session-Id", "")
         tried = []
         while True:
-            name, token = self.pool.pick(session, tried) if self.path.startswith("/v1/messages") else (None, None)
+            name, token = self.pool.pick(session, tried) if pooled else (None, None)
             if token:
                 headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
                 headers["Authorization"] = "Bearer " + token
@@ -414,16 +428,18 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 log(f"upstream failed: {error!r}")
                 self.send_error(502, "Claude account pool could not reach api.anthropic.com")
                 return
+            content = response.read() if response.status == 403 else None
+            text = zlib.decompress(content, 47) if content and response.getheader("Content-Encoding") == "gzip" else content
             if name:
-                self.pool.record(name, {k.lower(): v for k, v in response.getheaders()}, response.status)
-                if response.status in (401, 403, 429):
+                if self.pool.record(name, {k.lower(): v for k, v in response.getheaders()}, response.status, text or b""):
                     tried.append(name)
                     if self.pool.pick(session, tried)[0]:
-                        response.read()
                         self.finish_with(conn, response)
                         continue
+                elif content is not None:
+                    log(f"{name} refused with 403: {text[:300]!r}")
             try:
-                self.relay(response)
+                self.relay(response, content)
             except Exception:
                 conn.close()  # Claude Code went away mid-reply; the rest of it is unread
                 raise
